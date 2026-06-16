@@ -1,8 +1,6 @@
-# Wallet Transfer Service
+# Wallet Transfer Service - Design Document
 
 ## Problem Statement
-
-The objective is to build a wallet-to-wallet transfer service that guarantees:
 
 - Idempotent request processing
 - Double-entry ledger consistency
@@ -26,15 +24,17 @@ Before implementation, the following architectural decisions were made.
 
 ## Idempotency Strategy
 
-A dedicated `idempotency_records` table is used.
+The service guarantees **exactly-once API semantics** using a dedicated `idempotency_records` table.
 
 Each request contains:
 
-```text
-idempotencyKey
+```json
+{
+  "idempotencyKey": "abc123"
+}
 ```
 
-A SHA-256 request fingerprint (`requestHash`) is generated using:
+A SHA-256 request fingerprint (`requestHash`) is generated from:
 
 ```text
 fromWalletId
@@ -42,7 +42,7 @@ toWalletId
 amount
 ```
 
-### Behavior
+### Processing Rules
 
 | Scenario | Result |
 |-----------|----------|
@@ -56,8 +56,8 @@ Without request hashing:
 
 ```json
 {
-  "idempotencyKey":"abc123",
-  "amount":100
+  "idempotencyKey": "abc123",
+  "amount": 100
 }
 ```
 
@@ -65,8 +65,8 @@ and
 
 ```json
 {
-  "idempotencyKey":"abc123",
-  "amount":500
+  "idempotencyKey": "abc123",
+  "amount": 500
 }
 ```
 
@@ -74,37 +74,60 @@ would incorrectly be treated as the same request.
 
 The request fingerprint ensures that the same idempotency key cannot be reused for a different business operation.
 
+### Source of Truth
+
+The **idempotency_records** table is the authoritative source for idempotency handling.
+
+The `transfers` table does **not** store `idempotency_key`.
+
+Reason:
+
+- Separation of concerns
+- Cleaner domain model
+- Dedicated retry management
+- Avoid duplicated responsibility
+
 ---
 
 ## Concurrency Strategy
 
-The service uses:
+The service uses PostgreSQL row-level locking through JPA pessimistic locking.
 
 ```java
-@Lock(PESSIMISTIC_WRITE)
+@Lock(LockModeType.PESSIMISTIC_WRITE)
 ```
 
-Equivalent PostgreSQL statement:
+Equivalent SQL:
 
 ```sql
 SELECT *
 FROM wallets
+WHERE id IN (:sourceWalletId, :destinationWalletId)
+ORDER BY id
 FOR UPDATE;
 ```
 
 ### Why?
 
-This prevents:
+This locks only the wallets participating in the transfer.
 
-- Double spending
-- Lost updates
-- Race conditions
+Benefits:
 
-Example:
+- Prevents double spending
+- Prevents lost updates
+- Prevents race conditions
+
+### Example
+
+Initial balance:
 
 ```text
-Wallet Balance = 100
+Wallet A = 100
+```
 
+Concurrent requests:
+
+```text
 Transfer A = 80
 Transfer B = 80
 ```
@@ -112,61 +135,65 @@ Transfer B = 80
 Without locking:
 
 ```text
-Both requests read 100
+Both read balance = 100
 Both succeed
+
 Final balance = -60
 ```
 
-With pessimistic locking:
+With locking:
 
 ```text
 Transfer A acquires lock
 Transfer B waits
 
 Transfer A completes
+
 Transfer B rechecks balance
 
-Transfer B fails
+Transfer B fails due to insufficient funds
 ```
 
-Result:
+Final result:
 
 ```text
-Final Balance = 20
+Balance = 20
 ```
 
 ---
 
 ## Deadlock Prevention
 
-Wallets are always locked in deterministic order.
+Wallet rows are always locked in deterministic order.
 
 ```text
-Lower Wallet ID
-       ↓
-Higher Wallet ID
+Smaller Wallet ID
+        ↓
+Larger Wallet ID
 ```
 
-This prevents circular wait conditions.
+Every transaction follows the same ordering strategy.
+
+This eliminates circular wait conditions and prevents deadlocks.
 
 ---
 
 ## Transaction Safety
 
-The entire transfer workflow executes inside a single transaction.
+The complete transfer workflow executes inside a single database transaction.
 
 ```java
 @Transactional
 ```
 
-If any step fails:
+If any operation fails:
 
-- Wallet update
-- Transfer save
-- Ledger creation
-- Idempotency persistence
+- Wallet balance update
+- Transfer persistence
+- Ledger entry creation
+- Idempotency record persistence
 
-everything is rolled back.
+the entire transaction rolls back.
 
 This guarantees atomicity.
 
@@ -174,7 +201,7 @@ This guarantees atomicity.
 
 ## Ledger Consistency
 
-Every transfer creates:
+Every transfer generates exactly:
 
 ```text
 1 Debit Entry
@@ -184,22 +211,24 @@ Every transfer creates:
 Example:
 
 ```text
-Wallet A -> Wallet B
+Wallet A → Wallet B
 Amount = 100
 ```
 
 Ledger:
 
 ```text
-Wallet A   DEBIT    100
-Wallet B   CREDIT   100
+Wallet A   DEBIT   100
+Wallet B   CREDIT  100
 ```
 
 Invariant:
 
 ```text
-Total Debit = Total Credit
+Total Debits = Total Credits
 ```
+
+This guarantees accounting consistency.
 
 ---
 
@@ -213,6 +242,7 @@ The assignment requires:
 - Strong consistency
 - Referential integrity
 - Row-level locking
+- Transaction isolation
 
 These are native strengths of relational databases.
 
@@ -223,11 +253,12 @@ These are native strengths of relational databases.
 PostgreSQL provides:
 
 - Mature transaction handling
-- Strong concurrency control
-- Reliable locking semantics
-- Excellent support for financial systems
+- Strong locking semantics
+- Reliable concurrency control
+- Advanced indexing capabilities
+- Excellent support for financial workloads
 
-Since correctness is more important than raw throughput, PostgreSQL is a natural choice.
+Since correctness is more important than raw throughput for this assignment, PostgreSQL is a natural choice.
 
 ---
 
@@ -267,133 +298,216 @@ Since correctness is more important than raw throughput, PostgreSQL is a natural
 
 The system is modeled around four business entities.
 
-## Core Domains
-
 | Domain | Responsibility |
 |----------|----------------|
 | Wallet | Current balance |
 | Transfer | Business transaction |
-| LedgerEntry | Accounting records |
+| LedgerEntry | Accounting record |
 | IdempotencyRecord | Retry protection |
+
+Each entity owns a specific business responsibility.
 
 ---
 
 # Entity Relationship Diagram
 
 ```text
-+----------------+
-|    Wallet      |
-+----------------+
-| id             |
-| balance        |
-+----------------+
-       |
-       | 1
-       |
-       | *
-+----------------+
-|   Transfer     |
-+----------------+
-| id             |
-| amount         |
-| status         |
-+----------------+
-       |
-       | 1
-       |
-       | 2
-+----------------+
-| Ledger Entry   |
-+----------------+
-| DEBIT/CREDIT   |
-+----------------+
++------------------+
+|     Wallet       |
++------------------+
+| id               |
+| balance          |
++------------------+
+        ^
+        |
+        |
++------------------+
+|    Transfer      |
++------------------+
+| id               |
+| from_wallet_id   |
+| to_wallet_id     |
+| amount           |
+| status           |
++------------------+
+        |
+        |
+        v
++------------------+
+|  Ledger Entry    |
++------------------+
+| transfer_id      |
+| wallet_id        |
+| entry_type       |
+| amount           |
++------------------+
 
 Transfer
-     |
-     | 1
-     |
-     | 1
-+--------------------+
-| IdempotencyRecord  |
-+--------------------+
+    |
+    |
+    v
++----------------------+
+| Idempotency Record   |
++----------------------+
+| request_hash         |
+| response_payload     |
++----------------------+
 ```
 
 ---
 
-# Database Schema
+# Database Schema Design
+
+The database model is intentionally split into separate tables so each table has a single responsibility.
+
+---
 
 ## wallets
 
-| Column | Type | Description |
+Stores the current spendable balance.
+
+| Column | Type | Constraints |
 |----------|----------|-------------|
 | id | UUID | Primary Key |
-| balance | BIGINT | Current balance |
-| version | BIGINT | Future optimistic locking |
-| created_at | TIMESTAMP | Audit timestamp |
+| balance | BIGINT | NOT NULL |
+| version | BIGINT | NOT NULL |
+| created_at | TIMESTAMP | NOT NULL |
+
+### Constraints
+
+```sql
+PRIMARY KEY (id)
+```
+
+### Indexes
+
+```sql
+PRIMARY KEY (id)
+```
 
 ### Responsibility
 
-Stores the current spendable balance.
+Represents the current state of a wallet.
 
 ---
 
 ## transfers
 
-| Column | Type | Description |
+Stores business transaction information.
+
+| Column | Type | Constraints |
 |----------|----------|-------------|
 | id | UUID | Primary Key |
-| idempotency_key | VARCHAR | Retry key |
-| from_wallet_id | UUID | Source wallet |
-| to_wallet_id | UUID | Destination wallet |
-| amount | BIGINT | Transfer amount |
-| status | VARCHAR | PENDING / PROCESSED / FAILED |
-| created_at | TIMESTAMP | Audit timestamp |
+| from_wallet_id | UUID | Foreign Key |
+| to_wallet_id | UUID | Foreign Key |
+| amount | BIGINT | NOT NULL |
+| status | VARCHAR(30) | NOT NULL |
+| created_at | TIMESTAMP | NOT NULL |
 
-### Foreign Keys
+### Constraints
 
-```text
-from_wallet_id -> wallets.id
-to_wallet_id   -> wallets.id
+```sql
+PRIMARY KEY(id)
+
+FOREIGN KEY(from_wallet_id)
+REFERENCES wallets(id)
+
+FOREIGN KEY(to_wallet_id)
+REFERENCES wallets(id)
 ```
+
+### Indexes
+
+```sql
+CREATE INDEX idx_transfer_source_wallet
+ON transfers(from_wallet_id);
+
+CREATE INDEX idx_transfer_destination_wallet
+ON transfers(to_wallet_id);
+```
+
+### Responsibility
+
+Represents the business transfer lifecycle.
 
 ---
 
 ## ledger_entries
 
-| Column | Type | Description |
+Stores immutable accounting records.
+
+| Column | Type | Constraints |
 |----------|----------|-------------|
 | id | UUID | Primary Key |
-| transfer_id | UUID | Parent transfer |
-| wallet_id | UUID | Related wallet |
-| entry_type | VARCHAR | DEBIT / CREDIT |
-| amount | BIGINT | Entry amount |
-| created_at | TIMESTAMP | Audit timestamp |
+| transfer_id | UUID | Foreign Key |
+| wallet_id | UUID | Foreign Key |
+| entry_type | VARCHAR(20) | NOT NULL |
+| amount | BIGINT | NOT NULL |
+| created_at | TIMESTAMP | NOT NULL |
 
-### Foreign Keys
+### Constraints
 
-```text
-transfer_id -> transfers.id
-wallet_id   -> wallets.id
+```sql
+PRIMARY KEY(id)
+
+FOREIGN KEY(transfer_id)
+REFERENCES transfers(id)
+
+FOREIGN KEY(wallet_id)
+REFERENCES wallets(id)
 ```
+
+### Indexes
+
+```sql
+CREATE INDEX idx_ledger_transfer
+ON ledger_entries(transfer_id);
+
+CREATE INDEX idx_ledger_wallet
+ON ledger_entries(wallet_id);
+```
+
+### Responsibility
+
+Provides an immutable accounting trail.
 
 ---
 
 ## idempotency_records
 
-| Column | Type | Description |
+Stores retry metadata and original response information.
+
+| Column | Type | Constraints |
 |----------|----------|-------------|
-| idempotency_key | VARCHAR | Primary Key |
-| request_hash | VARCHAR | Request fingerprint |
-| transfer_id | UUID | Related transfer |
-| response_payload | TEXT | Stored response |
-| status | VARCHAR | PENDING / COMPLETED |
-| created_at | TIMESTAMP | Audit timestamp |
+| idempotency_key | VARCHAR(255) | Primary Key |
+| request_hash | VARCHAR(128) | NOT NULL |
+| transfer_id | UUID | Foreign Key |
+| response_payload | TEXT | NULL |
+| status | VARCHAR(30) | NOT NULL |
+| created_at | TIMESTAMP | NOT NULL |
 
-### Foreign Keys
+### Constraints
 
-```text
-transfer_id -> transfers.id
+```sql
+PRIMARY KEY(idempotency_key)
+
+FOREIGN KEY(transfer_id)
+REFERENCES transfers(id)
 ```
+
+### Indexes
+
+```sql
+CREATE UNIQUE INDEX idx_idempotency_key
+ON idempotency_records(idempotency_key);
+
+CREATE INDEX idx_request_hash
+ON idempotency_records(request_hash);
+```
+
+### Responsibility
+
+Provides exactly-once request processing and retry safety.
 
 ---
 
@@ -404,7 +518,7 @@ transfer_id -> transfers.id
 
 2. Generate Request Hash
 
-3. Check Idempotency Table
+3. Check Idempotency Record
 
 4. Lock Source Wallet
 
@@ -424,7 +538,7 @@ transfer_id -> transfers.id
 
 12. Mark Transfer PROCESSED
 
-13. Store Response
+13. Persist Idempotency Record
 
 14. Commit Transaction
 ```
@@ -433,27 +547,26 @@ transfer_id -> transfers.id
 
 # Transfer State Machine
 
+Supported states:
+
 ```text
 PENDING
-   |
-   +------> PROCESSED
-
-   |
-   +------> FAILED
+PROCESSED
+FAILED
 ```
 
 Allowed transitions:
 
 ```text
-PENDING -> PROCESSED
-PENDING -> FAILED
+PENDING → PROCESSED
+PENDING → FAILED
 ```
 
 Rejected transitions:
 
 ```text
-PROCESSED -> PENDING
-FAILED -> PROCESSED
+PROCESSED → PENDING
+FAILED → PROCESSED
 ```
 
 ---
@@ -462,14 +575,14 @@ FAILED -> PROCESSED
 
 ## Single Responsibility Principle
 
-Each class has a single responsibility.
+Each class has one responsibility.
 
 Examples:
 
 - TransferController
 - TransferServiceImpl
-- LedgerEntryFactory
 - WalletRepository
+- LedgerEntryFactory
 
 ---
 
@@ -484,20 +597,22 @@ DEBIT
 CREDIT
 ```
 
-can later become:
+can later evolve into:
 
 ```text
 DEBIT
 CREDIT
-REVERSAL
 REFUND
+REVERSAL
 ```
 
 ---
 
 ## Liskov Substitution Principle
 
-Services are consumed through abstractions.
+Consumers depend on abstractions.
+
+Example:
 
 ```java
 TransferService
@@ -509,13 +624,21 @@ can be replaced by:
 TransferServiceImpl
 ```
 
-without changing consumers.
+without impacting consumers.
 
 ---
 
 ## Interface Segregation Principle
 
-Interfaces expose only relevant operations.
+Interfaces expose only relevant behavior.
+
+Example:
+
+```java
+TransferService
+```
+
+contains transfer-specific operations only.
 
 ---
 
@@ -525,18 +648,20 @@ Controllers depend on service abstractions.
 
 Services depend on repository abstractions.
 
+Spring injects concrete implementations.
+
 ---
 
 # Design Patterns
 
 | Pattern | Usage |
-|-----------|---------|
+|----------|---------|
 | Repository Pattern | Database abstraction |
 | Service Layer Pattern | Business orchestration |
-| Factory Pattern | Ledger creation |
-| Builder Pattern | DTO and Entity construction |
+| Factory Pattern | Ledger entry creation |
+| Builder Pattern | DTO and entity construction |
 | Rich Domain Model | Business rules inside entities |
-| State Pattern | Transfer lifecycle |
+| State Transition Pattern | Transfer lifecycle management |
 | Idempotency Record Pattern | Retry-safe processing |
 
 ---
@@ -545,21 +670,31 @@ Services depend on repository abstractions.
 
 ## Unit Tests
 
+Validate:
+
 - Balance validation
 - State transitions
+- Ledger creation logic
 - Idempotency validation
+
+---
 
 ## Integration Tests
 
+Validate:
+
 - Transfer execution
-- Ledger creation
-- Database persistence
+- Ledger persistence
+- Transaction boundaries
+- Idempotency behavior
 
 Using:
 
 ```text
 PostgreSQL Testcontainers
 ```
+
+---
 
 ## Concurrency Test
 
@@ -572,58 +707,35 @@ Transfer A = 80
 Transfer B = 80
 ```
 
-Expected:
+Expected result:
 
 ```text
-One success
-One failure
+One transfer succeeds
+
+One transfer fails
+
 Final balance = 20
 ```
+
+This validates the pessimistic locking strategy.
 
 ---
 
 # Future Improvements
 
+The current implementation intentionally uses a modular monolith because the assignment prioritizes correctness, simplicity, and delivery speed.
+
+Potential future enhancements:
+
 ## Outbox Pattern
 
-Reliable event publishing.
+Reliable event publishing after successful transactions.
 
 ## Saga Pattern
 
-If system evolves into microservices.
+If the application evolves into multiple services.
 
-## Transfer History API
-
-Transfer tracking and auditing.
-
-## Event Driven Architecture
-
-Notifications and reporting.
-
-## Ledger Derived Balances
-
-Compute balances directly from ledger.
-
-## Optimistic Locking
-
-Possible performance optimization.
-
----
-
-# Tradeoffs
-
-A modular monolith was chosen instead of microservices.
-
-### Advantages
-
-- Faster delivery
-- Simpler deployment
-- Strong transactional consistency
-- Easier testing
-
-### Future Evolution
-
-If the platform grows:
+Example:
 
 ```text
 Wallet Service
@@ -631,4 +743,38 @@ Ledger Service
 Notification Service
 ```
 
-can be separated and coordinated using Saga Pattern.
+Saga can coordinate distributed workflows and compensating actions.
+
+## Transfer History API
+
+Support transfer auditing and reporting.
+
+## Event-Driven Architecture
+
+Real-time notifications and reporting pipelines.
+
+## Ledger-Derived Balances
+
+Calculate balances directly from ledger entries for stronger auditability.
+
+## Optimistic Locking
+
+Potential throughput optimization for specific workloads.
+
+---
+
+# Tradeoffs
+
+A modular monolithic architecture was chosen instead of microservices.
+
+### Advantages
+
+- Faster delivery
+- Simpler deployment
+- Easier testing
+- Strong transactional consistency
+- No distributed transaction complexity
+
+### Future Evolution
+
+The current design can evolve into independently deployable services if business scale and organizational requirements justify the additional complexity.
